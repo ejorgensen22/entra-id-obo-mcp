@@ -11,3 +11,7 @@ __pycache__/
 .vscode/
 *.log
 .DS_Store
+cdk.out/
+infrastructure/cdk/cdk.out/
+*.swp
+node_modules/

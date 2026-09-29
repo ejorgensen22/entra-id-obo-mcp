@@ -27,6 +27,11 @@ import msal
 
 from config import Settings
 
+GRAPH_AUDIENCES = {
+    "00000003-0000-0000-c000-000000000000",
+    "https://graph.microsoft.com",
+}
+
 
 class OboError(RuntimeError):
     def __init__(self, message: str, *, entra_error: dict[str, Any] | None = None):
@@ -48,6 +53,7 @@ class EntraOboClient:
         self.settings = settings
         self._lock = threading.Lock()
         self._cache: dict[str, CachedToken] = {}
+        self._apps: dict[str, msal.ConfidentialClientApplication] = {}
 
     def inspect_assertion(self, assertion: str) -> dict[str, Any]:
         claims = jwt.decode(assertion, options={"verify_signature": False})
@@ -69,7 +75,15 @@ class EntraOboClient:
             "azp": claims.get("azp") or claims.get("appid"),
             "iss": claims.get("iss"),
             "exp": claims.get("exp"),
+            "ver": claims.get("ver"),
             "idtyp": claims.get("idtyp"),
+        }
+
+    def expected_mcp_audiences(self) -> set[str]:
+        return {
+            self.settings.client_id,
+            self.settings.identifier_uri,
+            f"api://{self.settings.client_id}",
         }
 
     def exchange(self, assertion: str, scopes: list[str] | None = None) -> str:
@@ -79,6 +93,10 @@ class EntraOboClient:
         target_scopes = tuple(scopes or self.settings.graph_scopes)
         claims = self.inspect_assertion(assertion)
         self._reject_wrong_audience(claims)
+        if claims.get("idtyp") == "app":
+            raise OboError(
+                "Inbound token is app-only (idtyp=app). OBO requires a user access token."
+            )
 
         cache_key = self._cache_key(assertion, target_scopes)
         with self._lock:
@@ -87,11 +105,7 @@ class EntraOboClient:
                 return cached.access_token
 
         tid = claims.get("tid") or self.settings.tenant_id
-        app = msal.ConfidentialClientApplication(
-            client_id=self.settings.client_id,
-            client_credential=self.settings.client_secret,
-            authority=f"https://login.microsoftonline.com/{tid}",
-        )
+        app = self._msal_app(str(tid))
         result = app.acquire_token_on_behalf_of(
             user_assertion=assertion,
             scopes=list(target_scopes),
@@ -102,6 +116,8 @@ class EntraOboClient:
                 entra_error=result,
             )
 
+        self.validate_obo_pair(assertion, result["access_token"])
+
         expires_in = int(result.get("expires_in") or 3600)
         with self._lock:
             self._cache[cache_key] = CachedToken(
@@ -110,6 +126,41 @@ class EntraOboClient:
                 scopes=target_scopes,
             )
         return result["access_token"]
+
+    def validate_obo_pair(self, inbound: str, downstream: str) -> dict[str, Any]:
+        """Compare inbound MCP-audience claims to the OBO-issued Graph token."""
+        a = self.inspect_assertion(inbound)
+        b = self.inspect_assertion(downstream)
+        errors: list[str] = []
+
+        if a.get("idtyp") == "app":
+            errors.append("inbound is app-only; OBO requires a user token")
+        if a.get("oid") and b.get("oid") and a.get("oid") != b.get("oid"):
+            errors.append(f"oid mismatch inbound={a.get('oid')} graph={b.get('oid')}")
+        if a.get("tid") and b.get("tid") and a.get("tid") != b.get("tid"):
+            errors.append(f"tid mismatch inbound={a.get('tid')} graph={b.get('tid')}")
+
+        graph_auds = {str(item) for item in b.get("aud") or []}
+        if graph_auds and graph_auds.isdisjoint(GRAPH_AUDIENCES):
+            errors.append(f"downstream aud is not Graph: {sorted(graph_auds)}")
+
+        azp = b.get("azp")
+        if azp and azp != self.settings.client_id:
+            errors.append(f"downstream azp {azp} is not this MCP app {self.settings.client_id}")
+
+        if errors:
+            raise OboError("OBO claim validation failed: " + "; ".join(errors))
+
+        return {
+            "ok": True,
+            "same_user_oid": a.get("oid") == b.get("oid"),
+            "same_tid": a.get("tid") == b.get("tid"),
+            "inbound_aud": a.get("aud"),
+            "graph_aud": b.get("aud"),
+            "graph_azp": azp,
+            "inbound_scp": a.get("scp"),
+            "graph_scp": b.get("scp"),
+        }
 
     async def graph_get(self, assertion: str, path: str, scopes: list[str] | None = None) -> Any:
         token = self.exchange(assertion, scopes)
@@ -136,13 +187,21 @@ class EntraOboClient:
             "requested_token_use=on_behalf_of"
         )
 
+    def _msal_app(self, tid: str) -> msal.ConfidentialClientApplication:
+        with self._lock:
+            app = self._apps.get(tid)
+            if app is None:
+                app = msal.ConfidentialClientApplication(
+                    client_id=self.settings.client_id,
+                    client_credential=self.settings.client_secret,
+                    authority=f"https://login.microsoftonline.com/{tid}",
+                )
+                self._apps[tid] = app
+            return app
+
     def _reject_wrong_audience(self, claims: dict[str, Any]) -> None:
         audiences = {str(item) for item in claims.get("aud") or []}
-        expected = {
-            self.settings.client_id,
-            self.settings.identifier_uri,
-            f"api://{self.settings.client_id}",
-        }
+        expected = self.expected_mcp_audiences()
         if audiences and audiences.isdisjoint(expected):
             raise OboError(
                 "Inbound token audience is not this MCP app, so Entra will reject "

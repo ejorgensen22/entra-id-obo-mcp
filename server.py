@@ -17,12 +17,16 @@ obo = EntraOboClient(settings)
 def build_auth():
     """Create FastMCP auth.
 
-    bearer — RemoteAuthProvider + AzureJWTVerifier. Clients present an Entra JWT
-             whose audience is this MCP app. Best for the device-code demo client
-             and for pre-authorized hosts (VS Code).
-    proxy  — AzureProvider OAuth proxy. FastMCP stands in front of Entra so MCP
-             clients that expect Dynamic Client Registration can still sign in.
+    bearer    — RemoteAuthProvider + AzureJWTVerifier. Clients present an Entra JWT
+                whose audience is this MCP app. Best for the device-code demo client.
+    proxy     — AzureProvider OAuth proxy. FastMCP stands in front of Entra so MCP
+                clients that expect Dynamic Client Registration can still sign in.
+    agentcore — No in-process verifier. Amazon Bedrock AgentCore Runtime validates
+                the Entra JWT at the edge and forwards Authorization to this process.
     """
+    if settings.auth_mode == "agentcore":
+        return None
+
     if settings.auth_mode == "proxy":
         from fastmcp.server.auth.providers.azure import AzureProvider
 
@@ -61,6 +65,9 @@ mcp = FastMCP(
         "call Microsoft Graph as the signed-in user."
     ),
     auth=build_auth(),
+    host=settings.host,
+    port=settings.port,
+    stateless_http=True,
 )
 
 
@@ -68,9 +75,8 @@ def _inbound_token() -> str:
     token = get_access_token()
     if token is None or not getattr(token, "token", None):
         raise OboError(
-            "No bearer token on this request. In AUTH_MODE=bearer the MCP client "
-            "must send an Entra access token for "
-            f"{settings.mcp_scope_full}."
+            "No bearer token on this request. Send an Entra access token for "
+            f"{settings.mcp_scope_full}. On AgentCore, allowlist the Authorization header."
         )
     return token.token
 
@@ -80,14 +86,10 @@ def whoami_mcp() -> dict[str, Any]:
     """Show claims from the inbound token (audience should be this MCP app, not Graph)."""
     assertion = _inbound_token()
     claims = obo.inspect_assertion(assertion)
-    expected = {
-        settings.client_id,
-        settings.identifier_uri,
-        f"api://{settings.client_id}",
-    }
+    expected = obo.expected_mcp_audiences()
     audiences = set(claims["aud"])
     return {
-        "step": "1. inbound token validated by FastMCP",
+        "step": "1. inbound token",
         "auth_mode": settings.auth_mode,
         "audience_matches_mcp_app": bool(audiences & expected),
         "expected_audiences": sorted(expected),
@@ -110,14 +112,13 @@ async def whoami_graph() -> dict[str, Any]:
         scopes=["https://graph.microsoft.com/User.Read"],
     )
     graph_token = obo.exchange(assertion, ["https://graph.microsoft.com/User.Read"])
-    graph_claims = obo.inspect_assertion(graph_token)
+    pair = obo.validate_obo_pair(assertion, graph_token)
     return {
         "step": "2. OBO exchange then Graph /me",
         "inbound_aud": inbound["aud"],
-        "graph_aud": graph_claims["aud"],
-        "same_user_oid": inbound.get("oid") == graph_claims.get("oid") == profile.get("id"),
+        "claim_validation": pair,
+        "same_user_oid": inbound.get("oid") == profile.get("id"),
         "graph_profile": profile,
-        "graph_token_scp": graph_claims.get("scp"),
         "protocol": obo.raw_form_body(),
     }
 
@@ -170,15 +171,17 @@ def explain_obo() -> dict[str, Any]:
         "inbound_scope": settings.mcp_scope_full,
         "downstream_scopes": list(settings.graph_scopes),
         "form": obo.raw_form_body(),
+        "auth_mode": settings.auth_mode,
         "rules": [
             "assertion.aud must be this MCP app (AADSTS50013 otherwise)",
             "assertion must be a user token, not app-only",
             "Graph delegated permissions must already be consented",
             "use the tenant id from the token tid claim (guests)",
             "never return the Graph OBO token to the MCP client",
+            "on AgentCore, allowlist Authorization so OBO still receives the assertion",
         ],
     }
 
 
 if __name__ == "__main__":
-    mcp.run(transport="http", host="127.0.0.1", port=8000)
+    mcp.run(transport="streamable-http", host=settings.host, port=settings.port)
