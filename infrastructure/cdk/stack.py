@@ -135,10 +135,6 @@ class EntraOboMcpStack(Stack):
         runtime.node.add_dependency(image)
         runtime.node.add_dependency(role)
 
-        encoded_arn = cdk.Fn.join(
-            "",
-            cdk.Fn.split(":", cdk.Fn.join("%2F", cdk.Fn.split("/", runtime.attr_agent_runtime_arn))),
-        )
         encoded_arn = cdk.Fn.join("%3A", cdk.Fn.split(":", runtime.attr_agent_runtime_arn))
         encoded_arn = cdk.Fn.join("%2F", cdk.Fn.split("/", encoded_arn))
 
@@ -156,9 +152,14 @@ class EntraOboMcpStack(Stack):
         CfnOutput(self, "AgentRuntimeArn", value=runtime.attr_agent_runtime_arn)
         CfnOutput(self, "InvokeUrl", value=invoke_url)
         CfnOutput(self, "ImageUri", value=image.image_uri)
-        CfnOutput(self, "OidcDiscoveryUrl", value=(
-            f"https://login.microsoftonline.com/{tenant_id}/v2.0/.well-known/openid-configuration"
-        ))
+        CfnOutput(
+            self,
+            "OidcDiscoveryUrl",
+            value=(
+                f"https://login.microsoftonline.com/{tenant_id}"
+                "/v2.0/.well-known/openid-configuration"
+            ),
+        )
         CfnOutput(self, "SecretName", value=secret_name)
 
 
